@@ -112,26 +112,30 @@ except ImportError:
     IMPORT_OK = False
 
 import re
+import time
 
 # script options
 SETTINGS = {
+    'color_prompt': (
+        'darkgray',
+        'color for prompt'),
     'color_number': (
-        'yellow,magenta',
+        'gray,default',
         'color for buffer number (not selected)'),
     'color_number_selected': (
-        'yellow,red',
+        'gray,darkgray',
         'color for selected buffer number'),
     'color_name': (
-        'black,cyan',
+        'darkgray,default',
         'color for buffer name (not selected)'),
     'color_name_selected': (
-        'black,brown',
+        'white,lightmagenta',
         'color for a selected buffer name'),
     'color_name_highlight': (
-        'red,cyan',
+        'white,default',
         'color for highlight in buffer name (not selected)'),
     'color_name_highlight_selected': (
-        'red,brown',
+        'white,lightmagenta',
         'color for highlight in a selected buffer name'),
     'message': (
         'Go to: ',
@@ -184,6 +188,9 @@ old_input = None
 buffers = []
 buffers_pos = 0
 
+last_signal_time = 0
+
+signal_key_combo_default = None
 
 def go_option_enabled(option):
     """Checks if a boolean script option is enabled or not."""
@@ -205,9 +212,12 @@ def go_unhook_one(hook):
 
 def go_unhook_all():
     """Unhook all."""
-    go_unhook_one('modifier')
-    for hook in HOOK_COMMAND_RUN:
-        go_unhook_one(hook)
+    hook_names = []
+    for hook in hooks:
+        hook_names.append(hook)
+        weechat.unhook(hooks[hook])
+    for name in hook_names:
+        del hooks[name]
 
 
 def go_hook_all():
@@ -227,6 +237,9 @@ def go_hook_all():
     if 'modifier' not in hooks:
         hooks['modifier'] = weechat.hook_modifier(
             'input_text_display_with_cursor', 'go_input_modifier', '')
+    if 'signal_key_pressed' not in hooks:
+        hooks['signal_key_pressed'] = weechat.hook_signal(
+            'key_pressed', 'go_key_pressed_signal', '')
 
 
 def go_start(buf):
@@ -413,6 +426,9 @@ def go_buffers_to_string(listbuf, pos, strinput):
     string = ''
     strinput = strinput.lower()
     for i in range(len(listbuf)):
+        # FIX: won't scroll to selected item when tab to out-scope items
+        if i >= 10:
+            break
         selected = '_selected' if i == pos else ''
         buffer_name = listbuf[i]['name']
         index = buffer_name.lower().find(strinput)
@@ -450,19 +466,72 @@ def go_buffers_to_string(listbuf, pos, strinput):
             name += buffer_name[prev_index+1:]
         else:
             name = buffer_name
-        string += ' '
+        string += '\n'
         if go_option_enabled('buffer_number'):
-            string += '%s%s' % (
+            string += '%s %2d. ' % (
                 weechat.color(weechat.config_get_plugin(
                     'color_number' + selected)),
-                str(listbuf[i]['number']))
-        string += '%s%s%s' % (
+                listbuf[i]['number'])
+        string += '%s %s %s' % (
             weechat.color(weechat.config_get_plugin(
                 'color_name' + selected)),
             name,
             weechat.color('reset'))
     return '  ' + string if string else ''
 
+
+# run just once when exit by ESC key to solve combo key
+def go_key_combo_default_signal(data: str, signal: str, signal_data: str):
+    weechat.unhook(signal_key_combo_default)
+
+    buf = weechat.current_buffer()
+    c = signal_data[len("\x01["):]
+    if c[0] != "\x01":
+        l = len(c)
+        weechat.buffer_set(buf, 'input', "%s%s" % (saved_input, c))
+        weechat.buffer_set(buf, 'input_pos', "%d" % (saved_input_pos + l))
+    else:
+        p = ""
+        while len(c) > 0:
+            if c.startswith("\x01[["):
+                c = c[len("\x01[["):]
+                p += "meta2-"
+            elif c.startswith("\x01["):
+                c = c[len("\x01["):]
+                p += "meta-"
+            elif c.startswith("\x01"):
+                c = c[len("\x01"):]
+                p += "ctrl-"
+            else:
+                p += c[0]
+                c = c[1:]
+        infolist = weechat.infolist_get("key", "", "")
+        weechat.infolist_reset_item_cursor(infolist)
+        while weechat.infolist_next(infolist):
+            key = weechat.infolist_string(infolist, "key")
+            command = weechat.infolist_string(infolist, "command")
+            if key == p:
+                weechat.command(buf, command)
+        weechat.infolist_free(infolist)
+    return weechat.WEECHAT_RC_OK_EAT
+
+def go_key_pressed_signal(data: str, signal: str, signal_data: str):
+    global last_signal_time
+    last_signal_time = time.time()
+    if "\x01[" == signal_data:
+        weechat.hook_timer(50, 0, 1, "check_esc",
+            "{:f}".format(last_signal_time))
+    return weechat.WEECHAT_RC_OK
+
+def check_esc(data, remaining_calls):
+    global signal_key_combo_default
+    # Not perfect, would be better to use direct comparison (==) but that only
+    # works for py2 and not for py3.
+    if abs(last_signal_time - float(data)) <= 0.000001:
+        signal_key_combo_default = weechat.hook_signal(
+            'key_combo_default', 'go_key_combo_default_signal', '')
+        go_end(weechat.current_buffer())
+    return weechat.WEECHAT_RC_OK
 
 def go_input_modifier(data, modifier, modifier_data, string):
     """This modifier is called when input text item is built by WeeChat.
@@ -485,7 +554,9 @@ def go_input_modifier(data, modifier, modifier_data, string):
             buffers_pos = 0
         old_input = new_input
     names = go_buffers_to_string(buffers, buffers_pos, new_input.strip())
-    return weechat.config_get_plugin('message') + string + names
+    return weechat.color(weechat.config_get_plugin('color_prompt')) \
+        + weechat.config_get_plugin('message') + weechat.color('reset') \
+        + string + names
 
 
 def go_command_run_input(data, buf, command):
